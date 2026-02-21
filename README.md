@@ -2,7 +2,8 @@
 
 A native [COSMIC](https://system76.com/cosmic) desktop app for [The Gym Group](https://www.thegymgroup.com/) members.
 
-
+![Upcoming classes](imgs/upcoming.png)
+![Check-in history](imgs/history.png)
 
 ## Features
 
