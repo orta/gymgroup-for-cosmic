@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=Gymgroup For Cosmic
+Comment=A Gym class app for COSMIC
+Type=Application
+Icon=com.github.orta.gym
+Exec=gymgroup-for-cosmic %F
+Terminal=false
+StartupNotify=true
+Categories=COSMIC
+Keywords=COSMIC
+MimeType=
