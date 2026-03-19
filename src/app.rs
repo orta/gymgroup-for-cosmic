@@ -1071,7 +1071,7 @@ impl AppModel {
             }
         }
 
-        let cell_size: f32 = 12.0;
+        let cell_size: f32 = 10.0;
         let cell_gap: u16 = 2;
         let cell_pitch = cell_size + cell_gap as f32;
 
@@ -1198,10 +1198,16 @@ impl AppModel {
             content = content.push(section);
         }
 
-        widget::scrollable(content)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into()
+        widget::scrollable(
+            widget::container(content)
+                .padding(cosmic::iced::Padding {
+                    right: spacing.space_m as f32,
+                    ..Default::default()
+                }),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
     }
 }
 
