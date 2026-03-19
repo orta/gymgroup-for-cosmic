@@ -1,2 +1,35 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<svg viewBox="0 0 128 128" xmlns="http://www.w3.org/2000/svg"/>
+<svg viewBox="0 0 128 128" xmlns="http://www.w3.org/2000/svg">
+  <!-- Background circle -->
+  <circle cx="64" cy="64" r="60" fill="#E63946" stroke="#1D1D1D" stroke-width="3"/>
+
+  <!-- Barbell -->
+  <!-- Left weight plate -->
+  <rect x="15" y="50" width="12" height="28" rx="2" fill="#2D2D2D" stroke="#1D1D1D" stroke-width="2"/>
+  <rect x="27" y="52" width="8" height="24" rx="1" fill="#3D3D3D" stroke="#1D1D1D" stroke-width="1.5"/>
+
+  <!-- Bar -->
+  <rect x="35" y="60" width="58" height="8" rx="2" fill="#4D4D4D" stroke="#1D1D1D" stroke-width="2"/>
+
+  <!-- Right weight plate -->
+  <rect x="93" y="52" width="8" height="24" rx="1" fill="#3D3D3D" stroke="#1D1D1D" stroke-width="1.5"/>
+  <rect x="101" y="50" width="12" height="28" rx="2" fill="#2D2D2D" stroke="#1D1D1D" stroke-width="2"/>
+
+  <!-- Person silhouette -->
+  <!-- Head -->
+  <circle cx="64" cy="38" r="8" fill="#F1FAEE"/>
+
+  <!-- Body -->
+  <path d="M 64 46 L 64 70" stroke="#F1FAEE" stroke-width="6" stroke-linecap="round"/>
+
+  <!-- Arms (holding barbell) -->
+  <path d="M 64 50 L 45 64" stroke="#F1FAEE" stroke-width="5" stroke-linecap="round"/>
+  <path d="M 64 50 L 83 64" stroke="#F1FAEE" stroke-width="5" stroke-linecap="round"/>
+
+  <!-- Legs -->
+  <path d="M 64 70 L 54 90" stroke="#F1FAEE" stroke-width="5" stroke-linecap="round"/>
+  <path d="M 64 70 L 74 90" stroke="#F1FAEE" stroke-width="5" stroke-linecap="round"/>
+
+  <!-- Highlight on barbell for depth -->
+  <rect x="38" y="61.5" width="52" height="2" rx="1" fill="#6D6D6D" opacity="0.7"/>
+</svg>

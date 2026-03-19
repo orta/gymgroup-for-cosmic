@@ -2111,6 +2111,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "wayland-client",
 ]
 
 [[package]]

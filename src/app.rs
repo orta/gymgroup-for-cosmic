@@ -8,8 +8,21 @@ use cosmic::cosmic_config::{self, CosmicConfigEntry};
 use cosmic::iced::alignment::{Horizontal, Vertical};
 use cosmic::iced::{Alignment, Length, Subscription};
 use cosmic::widget::{self, about::About, icon, menu, nav_bar};
+use cosmic::iced_core::widget::Id as WidgetId;
 use cosmic::{prelude::*, Task};
 use std::collections::{HashMap, HashSet};
+
+fn note_input_id() -> WidgetId {
+    WidgetId::new("class-note-input")
+}
+
+#[derive(Debug, Clone)]
+struct MonitorInfo {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+}
 
 const REPOSITORY: &str = env!("CARGO_PKG_REPOSITORY");
 const APP_ICON: &[u8] = include_bytes!("../resources/icons/hicolor/scalable/apps/icon.svg");
@@ -52,6 +65,12 @@ pub struct AppModel {
 
     // --- Reminders ---
     notified_classes: HashSet<String>,
+    gym_warning: Option<String>,
+    warning_window_ids: Vec<cosmic::iced::window::Id>,
+
+    // --- Class notes ---
+    editing_note_key: String,
+    editing_note_text: String,
 }
 
 /// Messages emitted by the application and its widgets.
@@ -79,8 +98,18 @@ pub enum Message {
 
     Refresh,
 
+    // Class notes
+    OpenClassNote(String),
+    ClassNoteChanged(String),
+    SaveClassNote,
+
     // Reminders
     CheckReminders,
+
+    // Window control
+    CloseRequested,
+    WarningWindowOpened(cosmic::iced::window::Id),
+    WarningWindowClosed,
 
     // UI
     LaunchUrl(String),
@@ -179,6 +208,11 @@ impl cosmic::Application for AppModel {
             loading: has_credentials,
 
             notified_classes: HashSet::new(),
+            gym_warning: None,
+            warning_window_ids: Vec::new(),
+
+            editing_note_key: String::new(),
+            editing_note_text: String::new(),
         };
 
         let login_task = if has_credentials {
@@ -218,12 +252,42 @@ impl cosmic::Application for AppModel {
             return None;
         }
 
+        let spacing = cosmic::theme::spacing();
         Some(match self.context_page {
             ContextPage::About => context_drawer::about(
                 &self.about,
                 |url| Message::LaunchUrl(url.to_string()),
                 Message::ToggleContextPage(ContextPage::About),
             ),
+            ContextPage::ClassNote => {
+                let note_content = widget::column::with_capacity(3)
+                    .spacing(spacing.space_m)
+                    .push(widget::text::body(
+                        "This note will appear on every future occurrence of this class.",
+                    ))
+                    .push(
+                        widget::text_input("Add a note...", &self.editing_note_text)
+                            .on_input(Message::ClassNoteChanged)
+                            .id(note_input_id()),
+                    )
+                    .push(
+                        widget::row::with_capacity(2)
+                            .spacing(spacing.space_s)
+                            .push(
+                                widget::button::suggested("Save")
+                                    .on_press(Message::SaveClassNote),
+                            )
+                            .push(
+                                widget::button::text("Clear")
+                                    .on_press(Message::ClassNoteChanged(String::new())),
+                            ),
+                    );
+                context_drawer::context_drawer(
+                    note_content,
+                    Message::ToggleContextPage(ContextPage::ClassNote),
+                )
+                .title("Class Note")
+            }
         })
     }
 
@@ -242,7 +306,36 @@ impl cosmic::Application for AppModel {
             }
         };
 
-        widget::container(content)
+        // Wrap content with warning bar if needed
+        let content_with_warning = if let Some(ref warning_text) = self.gym_warning {
+            let warning_bar = widget::container(
+                widget::text(warning_text)
+                    .size(20)
+                    .align_x(Horizontal::Center)
+            )
+            .width(Length::Fill)
+            .height(80.0)
+            .align_x(Horizontal::Center)
+            .align_y(Vertical::Center)
+            .class(cosmic::theme::Container::custom(|_theme| {
+                widget::container::Style {
+                    background: Some(cosmic::iced::Background::Color(
+                        cosmic::iced::Color::from_rgb(0.8, 0.0, 0.0)
+                    )),
+                    text_color: Some(cosmic::iced::Color::WHITE),
+                    ..Default::default()
+                }
+            }));
+
+            widget::column::with_capacity(2)
+                .push(warning_bar)
+                .push(content)
+                .into()
+        } else {
+            content
+        };
+
+        widget::container(content_with_warning)
             .width(Length::Fill)
             .height(Length::Fill)
             .padding(space_m)
@@ -408,6 +501,33 @@ impl cosmic::Application for AppModel {
                 return self.fetch_classes();
             }
 
+            Message::OpenClassNote(key) => {
+                let note = self.config.class_notes.get(&key).cloned().unwrap_or_default();
+                self.editing_note_key = key;
+                self.editing_note_text = note;
+                self.context_page = ContextPage::ClassNote;
+                self.core.window.show_context = true;
+                return widget::text_input::focus(note_input_id());
+            }
+
+            Message::ClassNoteChanged(text) => {
+                self.editing_note_text = text;
+            }
+
+            Message::SaveClassNote => {
+                let key = self.editing_note_key.clone();
+                let mut new_notes = self.config.class_notes.clone();
+                if self.editing_note_text.is_empty() {
+                    new_notes.remove(&key);
+                } else {
+                    new_notes.insert(key, self.editing_note_text.clone());
+                }
+                if let Some(ref config_handler) = self.config_handler {
+                    let _ = self.config.set_class_notes(config_handler, new_notes);
+                }
+                self.core.window.show_context = false;
+            }
+
             Message::Refresh => {
                 self.loading = true;
                 return self.fetch_all_data();
@@ -417,6 +537,9 @@ impl cosmic::Application for AppModel {
                 let now_ms = chrono::Utc::now().timestamp_millis();
                 let fifteen_min_ms: i64 = 15 * 60 * 1000;
 
+                let mut found_warning = false;
+                let mut warning_text = String::new();
+
                 for class in &self.classes {
                     let is_booked = class.booked == Some(true);
                     let is_cancelled = class.cancelled == Some(true);
@@ -425,32 +548,77 @@ impl cosmic::Application for AppModel {
                     }
 
                     let class_id = class.class_id().to_string();
-                    if class_id.is_empty() || self.notified_classes.contains(&class_id) {
+                    if class_id.is_empty() {
                         continue;
                     }
 
                     if let Some(start_ms) = class.start_date_time {
                         let until_start = start_ms - now_ms;
-                        // Notify when class is 0–15 minutes away
+                        // Show warning when class is 0–15 minutes away
                         if until_start > 0 && until_start <= fifteen_min_ms {
                             let name = class.display_name().to_string();
                             let time = class.formatted_time();
-                            let body = format!("{name} starts at {time} — time to get ready!");
+                            warning_text = format!("🏋️ {name} starts at {time} — Time for the gym!");
+                            found_warning = true;
 
-                            if let Err(e) = notify_rust::Notification::new()
-                                .summary("Gym class in 15 minutes")
-                                .body(&body)
-                                .icon("x-office-calendar")
-                                .urgency(notify_rust::Urgency::Critical)
-                                .show()
-                            {
-                                eprintln!("Notification error: {e}");
+                            // Also show desktop notification once
+                            if !self.notified_classes.contains(&class_id) {
+                                if let Err(e) = notify_rust::Notification::new()
+                                    .summary("Gym class in 15 minutes")
+                                    .body(&format!("{name} starts at {time} — time to get ready!"))
+                                    .icon("x-office-calendar")
+                                    .urgency(notify_rust::Urgency::Critical)
+                                    .show()
+                                {
+                                    eprintln!("Notification error: {e}");
+                                }
+                                self.notified_classes.insert(class_id);
                             }
-
-                            self.notified_classes.insert(class_id);
+                            break;
                         }
                     }
                 }
+
+                // Update warning state and windows
+                if found_warning {
+                    self.gym_warning = Some(warning_text.clone());
+
+                    // Open warning windows if not already open (one per monitor)
+                    if self.warning_window_ids.is_empty() {
+                        return self.open_warning_windows();
+                    }
+                } else {
+                    self.gym_warning = None;
+
+                    // Close all warning windows if open
+                    if !self.warning_window_ids.is_empty() {
+                        let close_tasks: Vec<_> = self.warning_window_ids
+                            .drain(..)
+                            .map(cosmic::iced::window::close)
+                            .collect();
+                        return Task::batch(close_tasks);
+                    }
+                }
+            }
+
+            Message::WarningWindowOpened(id) => {
+                self.warning_window_ids.push(id);
+            }
+
+            Message::WarningWindowClosed => {
+                // Window was closed - remove it from tracking
+                // Note: we don't know which window, so we'll let it be cleaned up on next check
+            }
+
+            Message::CloseRequested => {
+                // If there's a gym warning, do nothing (prevent close)
+                // Otherwise, allow the app to exit by closing the window
+                if self.gym_warning.is_none() {
+                    if let Some(window_id) = self.core.main_window_id() {
+                        return cosmic::iced::window::close(window_id);
+                    }
+                }
+                // If there's a warning, just ignore the close request
             }
 
             Message::ToggleContextPage(context_page) => {
@@ -491,9 +659,101 @@ impl cosmic::Application for AppModel {
         let title_task = self.update_title();
         Task::batch([data_task, title_task])
     }
+
+    fn on_close_requested(&self, id: cosmic::iced::window::Id) -> Option<Self::Message> {
+        // Check if this is a warning window
+        if self.warning_window_ids.contains(&id) {
+            return Some(Message::WarningWindowClosed);
+        }
+
+        // For main window, intercept close requests
+        Some(Message::CloseRequested)
+    }
+
+    fn view_window(&self, id: cosmic::iced::window::Id) -> Element<Self::Message> {
+        // Check if this is a warning window
+        if self.warning_window_ids.contains(&id) {
+            return self.view_warning_window();
+        }
+
+        // Otherwise, use the default view
+        self.view()
+    }
 }
 
 impl AppModel {
+    fn open_warning_windows(&self) -> Task<cosmic::Action<Message>> {
+        // Get actual monitor information from the system
+        let monitors = get_monitor_info();
+
+        let mut tasks = Vec::new();
+
+        if monitors.is_empty() {
+            // Fallback: create one window if we can't detect monitors
+            eprintln!("Could not detect monitors, using fallback");
+            let settings = cosmic::iced::window::Settings {
+                size: cosmic::iced::Size::new(1920.0, 80.0),
+                position: cosmic::iced::window::Position::Specific(cosmic::iced::Point::new(0.0, 0.0)),
+                decorations: false,
+                transparent: false,
+                level: cosmic::iced::window::Level::AlwaysOnTop,
+                ..Default::default()
+            };
+
+            let (id, task) = cosmic::iced::window::open(settings);
+            tasks.push(task.map(move |_| cosmic::Action::App(Message::WarningWindowOpened(id))));
+        } else {
+            // Create one window per monitor
+            for monitor in monitors {
+                eprintln!("Creating warning window for monitor at {}x{} ({}x{})",
+                    monitor.x, monitor.y, monitor.width, monitor.height);
+
+                let settings = cosmic::iced::window::Settings {
+                    size: cosmic::iced::Size::new(monitor.width as f32, 80.0),
+                    position: cosmic::iced::window::Position::Specific(
+                        cosmic::iced::Point::new(monitor.x as f32, monitor.y as f32)
+                    ),
+                    decorations: false,
+                    transparent: false,
+                    level: cosmic::iced::window::Level::AlwaysOnTop,
+                    resizable: false,
+                    exit_on_close_request: false,
+                    ..Default::default()
+                };
+
+                let (id, task) = cosmic::iced::window::open(settings);
+                tasks.push(task.map(move |_| cosmic::Action::App(Message::WarningWindowOpened(id))));
+            }
+        }
+
+        Task::batch(tasks)
+    }
+
+    fn view_warning_window(&self) -> Element<Message> {
+        let warning_text = self.gym_warning.as_deref().unwrap_or("Time for the gym!");
+
+        widget::container(
+            widget::text(warning_text)
+                .size(24)
+                .align_x(Horizontal::Center)
+                .width(Length::Fill)
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(Horizontal::Center)
+        .align_y(Vertical::Center)
+        .class(cosmic::theme::Container::custom(|_theme| {
+            widget::container::Style {
+                background: Some(cosmic::iced::Background::Color(
+                    cosmic::iced::Color::from_rgb(0.8, 0.0, 0.0)
+                )),
+                text_color: Some(cosmic::iced::Color::WHITE),
+                ..Default::default()
+            }
+        }))
+        .into()
+    }
+
     pub fn update_title(&mut self) -> Task<cosmic::Action<Message>> {
         let mut window_title = fl!("app-title");
 
@@ -679,7 +939,14 @@ impl AppModel {
         } else {
             // Group classes by day
             let mut current_day = String::new();
-            let mut section = cosmic::widget::settings::section();
+            let new_section = || {
+                cosmic::widget::settings::section::with_column(
+                    cosmic::widget::list_column()
+                        .list_item_padding([spacing.space_xxs, 0])
+                        .divider_padding(0),
+                )
+            };
+            let mut section = new_section();
             let mut has_items = false;
 
             for class in &self.classes {
@@ -693,7 +960,7 @@ impl AppModel {
                     if has_items {
                         content = content.push(section);
                     }
-                    section = cosmic::widget::settings::section().title(day.clone());
+                    section = new_section().title(day.clone());
                     current_day = day;
                     has_items = false;
                 }
@@ -717,17 +984,25 @@ impl AppModel {
                 let is_cancelled = class.cancelled.unwrap_or(false);
                 let class_id = class.class_id().to_string();
 
-                let action_button: Element<'_, Message> = if is_cancelled {
-                    widget::text("Cancelled").into()
-                } else if is_booked {
-                    widget::button::destructive("Cancel")
-                        .on_press(Message::CancelClass(class_id))
-                        .into()
-                } else if class.is_full() {
-                    widget::text("Full").into()
-                } else {
-                    widget::button::suggested("Book")
-                        .on_press(Message::BookClass(class_id))
+                let action_button: Element<'_, Message> = {
+                    let btn: Element<'_, Message> = if is_cancelled {
+                        widget::text("Cancelled").into()
+                    } else if is_booked {
+                        widget::button::destructive("Cancel")
+                            .on_press(Message::CancelClass(class_id))
+                            .into()
+                    } else if class.is_full() {
+                        widget::text("Full").into()
+                    } else {
+                        widget::button::suggested("Book")
+                            .on_press(Message::BookClass(class_id))
+                            .into()
+                    };
+                    widget::container(btn)
+                        .padding(cosmic::iced::Padding {
+                            right: spacing.space_m as f32,
+                            ..Default::default()
+                        })
                         .into()
                 };
 
@@ -737,10 +1012,24 @@ impl AppModel {
                     format!("{label}  ({spots})")
                 };
 
-                section = section.add(cosmic::widget::settings::item(
-                    item_label,
-                    action_button,
-                ));
+                let note_key = class_note_key(class);
+                let note_text = self.config.class_notes.get(&note_key).cloned().unwrap_or_default();
+
+                let note_button = widget::button::text("✎")
+                    .on_press(Message::OpenClassNote(note_key));
+
+                let settings_item = if note_text.is_empty() {
+                    cosmic::widget::settings::item::builder(item_label)
+                        .icon(note_button)
+                        .control(action_button)
+                } else {
+                    cosmic::widget::settings::item::builder(item_label)
+                        .icon(note_button)
+                        .description(note_text)
+                        .control(action_button)
+                };
+
+                section = section.add(settings_item);
                 has_items = true;
             }
 
@@ -749,10 +1038,16 @@ impl AppModel {
             }
         }
 
-        widget::scrollable(content)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into()
+        widget::scrollable(
+            widget::container(content)
+                .padding(cosmic::iced::Padding {
+                    right: spacing.space_m as f32,
+                    ..Default::default()
+                }),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
     }
 
     fn view_contribution_graph(&self) -> Element<'_, Message> {
@@ -910,6 +1205,22 @@ impl AppModel {
     }
 }
 
+/// Stable key for a recurring class: "name_dayofweek_HH:MM".
+/// Monday = 0, …, Sunday = 6 (ISO weekday ordering).
+fn class_note_key(class: &crate::api::GymClass) -> String {
+    let name = class.display_name().to_string();
+    if let Some(ms) = class.start_date_time {
+        if let Some(dt) = chrono::DateTime::from_timestamp_millis(ms) {
+            use chrono::Datelike;
+            let local = dt.with_timezone(&chrono::Local);
+            let day = local.weekday().num_days_from_monday();
+            let time = local.format("%H:%M").to_string();
+            return format!("{name}_{day}_{time}");
+        }
+    }
+    name
+}
+
 fn contribution_color(count: u32) -> cosmic::iced::Color {
     match count {
         0 => cosmic::iced::Color::from_rgba(0.5, 0.5, 0.5, 0.15),
@@ -950,6 +1261,7 @@ pub enum Page {
 pub enum ContextPage {
     #[default]
     About,
+    ClassNote,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -967,4 +1279,92 @@ impl menu::action::MenuAction for MenuAction {
             MenuAction::Logout => Message::Logout,
         }
     }
+}
+
+fn get_monitor_info() -> Vec<MonitorInfo> {
+    use wayland_client::{Connection, Dispatch, QueueHandle};
+    use wayland_client::protocol::{wl_output, wl_registry};
+
+    struct State {
+        monitors: Vec<MonitorInfo>,
+        pending_monitors: HashMap<u32, MonitorInfo>,
+    }
+
+    impl Dispatch<wl_registry::WlRegistry, ()> for State {
+        fn event(
+            state: &mut Self,
+            _registry: &wl_registry::WlRegistry,
+            _event: wl_registry::Event,
+            _data: &(),
+            _conn: &Connection,
+            _qh: &QueueHandle<Self>,
+        ) {
+            // Registry events handled elsewhere
+        }
+    }
+
+    impl Dispatch<wl_output::WlOutput, u32> for State {
+        fn event(
+            state: &mut Self,
+            _output: &wl_output::WlOutput,
+            event: wl_output::Event,
+            id: &u32,
+            _conn: &Connection,
+            _qh: &QueueHandle<Self>,
+        ) {
+            let monitor = state.pending_monitors.entry(*id).or_insert(MonitorInfo {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            });
+
+            match event {
+                wl_output::Event::Geometry { x, y, .. } => {
+                    monitor.x = x;
+                    monitor.y = y;
+                }
+                wl_output::Event::Mode { width, height, .. } => {
+                    monitor.width = width as u32;
+                    monitor.height = height as u32;
+                }
+                wl_output::Event::Done => {
+                    state.monitors.push(monitor.clone());
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Try to connect to Wayland
+    let conn = match Connection::connect_to_env() {
+        Ok(conn) => conn,
+        Err(e) => {
+            eprintln!("Failed to connect to Wayland: {}", e);
+            return Vec::new();
+        }
+    };
+
+    let display = conn.display();
+    let mut event_queue = conn.new_event_queue();
+    let qh = event_queue.handle();
+
+    let _registry = display.get_registry(&qh, ());
+
+    let mut state = State {
+        monitors: Vec::new(),
+        pending_monitors: HashMap::new(),
+    };
+
+    // Try to get monitor info with a timeout
+    for _ in 0..10 {
+        if event_queue.roundtrip(&mut state).is_err() {
+            break;
+        }
+        if !state.monitors.is_empty() {
+            break;
+        }
+    }
+
+    state.monitors
 }
