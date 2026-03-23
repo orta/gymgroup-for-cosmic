@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use crate::api::{self, Busyness, CheckIn, GymClass};
-use crate::config::Config;
+use crate::config::{Config, PlusOneConfig};
 use crate::fl;
 use cosmic::app::context_drawer;
 use cosmic::cosmic_config::{self, CosmicConfigEntry};
@@ -71,6 +71,17 @@ pub struct AppModel {
     // --- Class notes ---
     editing_note_key: String,
     editing_note_text: String,
+
+    // --- Plus Ones (indexed same as config.plus_ones) ---
+    plus_one_clients: Vec<reqwest::Client>,
+    plus_one_uuids: Vec<Option<String>>,
+    /// Maps class_id → names of Plus Ones who are booked into that class.
+    plus_one_booked_by: HashMap<String, Vec<String>>,
+
+    // Plus One management form state
+    plus_one_form_name: String,
+    plus_one_form_username: String,
+    plus_one_form_pin: String,
 }
 
 /// Messages emitted by the application and its widgets.
@@ -110,6 +121,15 @@ pub enum Message {
     CloseRequested,
     WarningWindowOpened(cosmic::iced::window::Id),
     WarningWindowClosed,
+
+    // Plus Ones
+    PlusOneLoggedIn(usize, Result<api::LoginResponse, String>),
+    PlusOneClassesLoaded(usize, Result<Vec<GymClass>, String>),
+    AddPlusOne,
+    RemovePlusOne(usize),
+    PlusOneFormNameChanged(String),
+    PlusOneFormUsernameChanged(String),
+    PlusOneFormPinChanged(String),
 
     // UI
     LaunchUrl(String),
@@ -183,6 +203,12 @@ impl cosmic::Application for AppModel {
             Some(config.gym_name.clone())
         };
 
+        let plus_one_count = config.plus_ones.len();
+        let plus_one_clients: Vec<reqwest::Client> = (0..plus_one_count)
+            .map(|_| api::create_client())
+            .collect();
+        let plus_one_uuids: Vec<Option<String>> = vec![None; plus_one_count];
+
         let mut app = AppModel {
             core,
             context_page: ContextPage::default(),
@@ -213,6 +239,13 @@ impl cosmic::Application for AppModel {
 
             editing_note_key: String::new(),
             editing_note_text: String::new(),
+
+            plus_one_clients,
+            plus_one_uuids,
+            plus_one_booked_by: HashMap::new(),
+            plus_one_form_name: String::new(),
+            plus_one_form_username: String::new(),
+            plus_one_form_pin: String::new(),
         };
 
         let login_task = if has_credentials {
@@ -231,6 +264,8 @@ impl cosmic::Application for AppModel {
         ];
 
         if self.user_uuid.is_some() {
+            menu_items.push(menu::Item::Divider);
+            menu_items.push(menu::Item::Button("Plus Ones".to_string(), None, MenuAction::ManagePlusOnes));
             menu_items.push(menu::Item::Divider);
             menu_items.push(menu::Item::Button(fl!("logout"), None, MenuAction::Logout));
         }
@@ -259,6 +294,11 @@ impl cosmic::Application for AppModel {
                 |url| Message::LaunchUrl(url.to_string()),
                 Message::ToggleContextPage(ContextPage::About),
             ),
+            ContextPage::PlusOnes => context_drawer::context_drawer(
+                self.view_plus_ones(),
+                Message::ToggleContextPage(ContextPage::PlusOnes),
+            )
+            .title("Plus Ones"),
             ContextPage::ClassNote => {
                 let note_content = widget::column::with_capacity(3)
                     .spacing(spacing.space_m)
@@ -371,7 +411,7 @@ impl cosmic::Application for AppModel {
                         let _ = self.config.set_gym_name(config_handler, response.home_club_name);
                     }
 
-                    return self.fetch_all_data();
+                    return Task::batch([self.fetch_all_data(), self.do_plus_one_logins()]);
                 }
                 Err(e) => {
                     self.login_error = Some(e);
@@ -530,7 +570,8 @@ impl cosmic::Application for AppModel {
 
             Message::Refresh => {
                 self.loading = true;
-                return self.fetch_all_data();
+                self.plus_one_booked_by.clear();
+                return Task::batch([self.fetch_all_data(), self.do_plus_one_logins()]);
             }
 
             Message::CheckReminders => {
@@ -620,6 +661,85 @@ impl cosmic::Application for AppModel {
                 }
                 // If there's a warning, just ignore the close request
             }
+
+            Message::PlusOneLoggedIn(index, result) => {
+                match result {
+                    Ok(response) => {
+                        if index < self.plus_one_uuids.len() {
+                            self.plus_one_uuids[index] = Some(response.uuid);
+                            return self.fetch_plus_one_classes(index);
+                        }
+                    }
+                    Err(e) => eprintln!("Plus One login error: {e}"),
+                }
+            }
+
+            Message::PlusOneClassesLoaded(index, result) => {
+                if let Ok(classes) = result {
+                    if index < self.config.plus_ones.len() {
+                        let name = self.config.plus_ones[index].name.clone();
+                        for class in &classes {
+                            if class.booked == Some(true) {
+                                let class_id = class.class_id().to_string();
+                                if !class_id.is_empty() {
+                                    self.plus_one_booked_by
+                                        .entry(class_id)
+                                        .or_default()
+                                        .push(name.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            Message::AddPlusOne => {
+                if self.plus_one_form_name.is_empty()
+                    || self.plus_one_form_username.is_empty()
+                    || self.plus_one_form_pin.is_empty()
+                {
+                    return Task::none();
+                }
+                let new_plus_one = PlusOneConfig {
+                    name: std::mem::take(&mut self.plus_one_form_name),
+                    username: std::mem::take(&mut self.plus_one_form_username),
+                    pin: std::mem::take(&mut self.plus_one_form_pin),
+                };
+                let mut new_plus_ones = self.config.plus_ones.clone();
+                new_plus_ones.push(new_plus_one);
+                if let Some(ref config_handler) = self.config_handler {
+                    let _ = self.config.set_plus_ones(config_handler, new_plus_ones);
+                }
+                self.plus_one_clients.push(api::create_client());
+                self.plus_one_uuids.push(None);
+                let index = self.plus_one_clients.len() - 1;
+                return self.login_plus_one(index);
+            }
+
+            Message::RemovePlusOne(index) => {
+                if index < self.config.plus_ones.len() {
+                    let name = self.config.plus_ones[index].name.clone();
+                    let mut new_plus_ones = self.config.plus_ones.clone();
+                    new_plus_ones.remove(index);
+                    if let Some(ref config_handler) = self.config_handler {
+                        let _ = self.config.set_plus_ones(config_handler, new_plus_ones);
+                    }
+                    if index < self.plus_one_clients.len() {
+                        self.plus_one_clients.remove(index);
+                    }
+                    if index < self.plus_one_uuids.len() {
+                        self.plus_one_uuids.remove(index);
+                    }
+                    for names in self.plus_one_booked_by.values_mut() {
+                        names.retain(|n| n != &name);
+                    }
+                    self.plus_one_booked_by.retain(|_, names| !names.is_empty());
+                }
+            }
+
+            Message::PlusOneFormNameChanged(v) => self.plus_one_form_name = v,
+            Message::PlusOneFormUsernameChanged(v) => self.plus_one_form_username = v,
+            Message::PlusOneFormPinChanged(v) => self.plus_one_form_pin = v,
 
             Message::ToggleContextPage(context_page) => {
                 if self.context_page == context_page {
@@ -809,6 +929,39 @@ impl AppModel {
         Task::perform(
             async move { api::get_check_in_history(&client, &uuid).await },
             |result| cosmic::Action::App(Message::HistoryLoaded(result)),
+        )
+    }
+
+    fn login_plus_one(&self, index: usize) -> Task<cosmic::Action<Message>> {
+        if index >= self.config.plus_ones.len() {
+            return Task::none();
+        }
+        let client = self.plus_one_clients[index].clone();
+        let username = self.config.plus_ones[index].username.clone();
+        let pin = self.config.plus_ones[index].pin.clone();
+        Task::perform(
+            async move { api::login(&client, &username, &pin).await },
+            move |result| cosmic::Action::App(Message::PlusOneLoggedIn(index, result)),
+        )
+    }
+
+    fn do_plus_one_logins(&self) -> Task<cosmic::Action<Message>> {
+        let tasks: Vec<_> = (0..self.config.plus_ones.len())
+            .map(|i| self.login_plus_one(i))
+            .collect();
+        Task::batch(tasks)
+    }
+
+    fn fetch_plus_one_classes(&self, index: usize) -> Task<cosmic::Action<Message>> {
+        let client = self.plus_one_clients[index].clone();
+        let gym_uuid = self.gym_uuid.clone().unwrap_or_default();
+        let uuid = match self.plus_one_uuids.get(index).and_then(|u| u.as_ref()) {
+            Some(u) => u.clone(),
+            None => return Task::none(),
+        };
+        Task::perform(
+            async move { api::get_classes(&client, &gym_uuid, &uuid).await },
+            move |result| cosmic::Action::App(Message::PlusOneClassesLoaded(index, result)),
         )
     }
 
@@ -1018,14 +1171,27 @@ impl AppModel {
                 let note_button = widget::button::text("✎")
                     .on_press(Message::OpenClassNote(note_key));
 
-                let settings_item = if note_text.is_empty() {
+                let plus_one_text = self
+                    .plus_one_booked_by
+                    .get(class.class_id())
+                    .map(|names| format!("Also booked: {}", names.join(", ")))
+                    .unwrap_or_default();
+
+                let description = match (note_text.is_empty(), plus_one_text.is_empty()) {
+                    (false, false) => format!("{note_text}\n{plus_one_text}"),
+                    (false, true) => note_text,
+                    (true, false) => plus_one_text,
+                    (true, true) => String::new(),
+                };
+
+                let settings_item = if description.is_empty() {
                     cosmic::widget::settings::item::builder(item_label)
                         .icon(note_button)
                         .control(action_button)
                 } else {
                     cosmic::widget::settings::item::builder(item_label)
                         .icon(note_button)
-                        .description(note_text)
+                        .description(description)
                         .control(action_button)
                 };
 
@@ -1048,6 +1214,62 @@ impl AppModel {
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
+    }
+
+    fn view_plus_ones(&self) -> Element<'_, Message> {
+        let spacing = cosmic::theme::spacing();
+        let mut col = widget::column::with_capacity(12).spacing(spacing.space_m);
+
+        col = col.push(widget::text::body(
+            "Add family members or friends so you can see when they're also booked into the same classes.",
+        ));
+
+        for (i, plus_one) in self.config.plus_ones.iter().enumerate() {
+            let status = if self.plus_one_uuids.get(i).and_then(|u| u.as_ref()).is_some() {
+                "Connected"
+            } else {
+                "Connecting..."
+            };
+            let row = widget::row::with_capacity(3)
+                .spacing(spacing.space_s)
+                .align_y(Alignment::Center)
+                .push(widget::text(&plus_one.name).width(Length::Fill))
+                .push(widget::text(status))
+                .push(
+                    widget::button::destructive("Remove")
+                        .on_press(Message::RemovePlusOne(i)),
+                );
+            col = col.push(row);
+        }
+
+        if !self.config.plus_ones.is_empty() {
+            col = col.push(widget::divider::horizontal::default());
+        }
+
+        col = col.push(widget::text::title4("Add a Plus One"));
+        col = col.push(
+            widget::text_input("Name (e.g. Alice)", &self.plus_one_form_name)
+                .on_input(Message::PlusOneFormNameChanged),
+        );
+        col = col.push(
+            widget::text_input("Email address", &self.plus_one_form_username)
+                .on_input(Message::PlusOneFormUsernameChanged),
+        );
+        col = col.push(
+            widget::secure_input("PIN", &self.plus_one_form_pin, None::<Message>, true)
+                .on_input(Message::PlusOneFormPinChanged),
+        );
+
+        let can_add = !self.plus_one_form_name.is_empty()
+            && !self.plus_one_form_username.is_empty()
+            && !self.plus_one_form_pin.is_empty();
+        let mut add_btn = widget::button::suggested("Add");
+        if can_add {
+            add_btn = add_btn.on_press(Message::AddPlusOne);
+        }
+        col = col.push(add_btn);
+
+        col.into()
     }
 
     fn view_contribution_graph(&self) -> Element<'_, Message> {
@@ -1268,12 +1490,14 @@ pub enum ContextPage {
     #[default]
     About,
     ClassNote,
+    PlusOnes,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MenuAction {
     About,
     Logout,
+    ManagePlusOnes,
 }
 
 impl menu::action::MenuAction for MenuAction {
@@ -1283,6 +1507,7 @@ impl menu::action::MenuAction for MenuAction {
         match self {
             MenuAction::About => Message::ToggleContextPage(ContextPage::About),
             MenuAction::Logout => Message::Logout,
+            MenuAction::ManagePlusOnes => Message::ToggleContextPage(ContextPage::PlusOnes),
         }
     }
 }
